@@ -5,7 +5,7 @@
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Soạn đề kiểm tra định kì bằng AI</title>
 <meta name="description" content="Soạn đề kiểm tra định kì theo ma trận – bản đặc tả (Công văn 7991) bằng Claude API, có tạo file nghe audio. Chạy trên GitHub Pages.">
-<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/katex.min.css">
+<link rel="stylesheet" id="katexCss" href="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/katex.min.css" onerror="this.onerror=null;this.href='libs/katex/katex.min.css'">
 <style>
 :root{--bg:#f3f5fb;--panel:#fff;--ink:#14213d;--muted:#5d6a8a;--line:#dde3f1;--pri:#2c4fd6;--pri-ink:#fff;--acc:#0f9d8c;--warn:#b86e00;--bad:#c52f3b;--ok:#118a63;--chip:#eaeefb;--soft:#f6f8fe;--sh:0 1px 2px rgba(20,33,61,.06),0 8px 24px rgba(20,33,61,.06)}
 [data-theme=dark]{--bg:#0d1322;--panel:#141c32;--ink:#e7ebf8;--muted:#9ba7c7;--line:#263250;--pri:#7d98ff;--pri-ink:#0d1322;--acc:#38d6c1;--warn:#f0b24a;--bad:#ff7b86;--ok:#4fd4a5;--chip:#1b2542;--soft:#101830;--sh:0 1px 2px rgba(0,0,0,.4)}
@@ -191,7 +191,7 @@ function defaultState(){return{
 }}
 function deepMerge(def,sv){if(sv==null)return def;if(Array.isArray(def)||typeof def!=='object'||def===null)return sv;const o={};for(const k of Object.keys(def))o[k]=k in sv?deepMerge(def[k],sv[k]):def[k];for(const k of Object.keys(sv))if(!(k in o))o[k]=sv[k];return o}
 let S=deepMerge(defaultState(),LS.get('dgm_project',null));
-const CFG_DEF={provider:'claude',model:{claude:'claude-sonnet-5-5',gemini:'gemini-2.5-pro',openai:'gpt-5'},base:{claude:'',gemini:'',openai:''},maxTokens:16000,temp:'',remember:true,theme:'auto'};
+const CFG_DEF={provider:'claude',model:{claude:'claude-sonnet-5-5',gemini:'gemini-2.5-pro',openai:'gpt-5'},base:{claude:'',gemini:'',openai:''},maxTokens:16000,temp:'',remember:true,theme:'auto',net:{mode:'auto',proxy:''}};
 let CFG=deepMerge(CFG_DEF,LS.get('dgm_cfg',null));
 let KEYS=Object.assign({claude:'',gemini:'',openai:''},LS.get('dgm_keys',null)||(()=>{try{return JSON.parse(sessionStorage.getItem('dgm_keys')||'null')}catch(e){return null}})()||{});
 const ATT=[];            // tệp đính kèm (ảnh, PDF quét) — chỉ giữ trong phiên
@@ -250,7 +250,117 @@ const PROV={
 function showBusy(t){$('#busy').hidden=false;$('#busyTxt').textContent=t||'Đang xử lý…'}
 function setBusy(t){const e=$('#busyTxt');if(e)e.textContent=t}
 function hideBusy(){$('#busy').hidden=true}
-async function errText(res){let t='';try{t=await res.text();const j=JSON.parse(t);return'HTTP '+res.status+' — '+(j.error&&(j.error.message||j.error)||j.message||t)}catch(e){return'HTTP '+res.status+' — '+t.slice(0,300)}}
+const HTTP_HINT={401:'API key không đúng hoặc đã bị thu hồi',403:'API key không có quyền, hoặc bị chặn theo khu vực/tổ chức',404:'không tìm thấy mô hình hoặc địa chỉ API — kiểm tra tên mô hình',429:'vượt giới hạn tốc độ hoặc hạn mức — chờ một lúc hoặc kiểm tra số dư',500:'lỗi máy chủ AI — thử lại sau',502:'cổng kết nối lỗi — thử lại sau',503:'máy chủ AI đang bận — thử lại sau',504:'máy chủ AI phản hồi quá chậm — thử lại sau',529:'máy chủ AI đang quá tải — thử lại sau'};
+async function errText(res){let t='',m='';try{t=await res.text()}catch(e){}
+ try{const j=JSON.parse(t);m=(j.error&&(j.error.message||j.error))||j.message||t}catch(e){m=t.slice(0,300)}
+ if(typeof m!=='string')m=JSON.stringify(m);
+ return'HTTP '+res.status+(HTTP_HINT[res.status]?' ('+HTTP_HINT[res.status]+')':'')+' — '+m}
+
+/* ---------- 5b. Mạng: chạy được cả trên web lẫn trong bản .exe ----------
+   • Bản .exe (Electron) có “cầu nối mạng gốc” window.desktop: mọi lời gọi AI đi qua tiến trình chính của ứng dụng
+     → không bị CORS chặn, dùng được proxy của Windows hoặc proxy nhập tay, hỗ trợ streaming.
+   • Trình duyệt thường / GitHub Pages: dùng fetch bình thường. */
+const DESK=(window.desktop&&window.desktop.isDesktop)?window.desktop:null;
+const TAURI_FETCH=(window.__TAURI__&&window.__TAURI__.http&&typeof window.__TAURI__.http.fetch==='function')?window.__TAURI__.http.fetch:null;
+const HOST_KIND=DESK?'electron':TAURI_FETCH?'tauri':(location.protocol==='file:'?'file':'web');
+const HOST_NAME={electron:'Bản máy tính (.exe) — cầu nối mạng gốc',tauri:'Bản máy tính (Tauri) — cầu nối mạng gốc',file:'Mở trực tiếp từ tệp (không có cầu nối mạng)',web:'Trình duyệt web'};
+const NET={info:null,last:null,proxy:'',online:navigator.onLine!==false};
+let NETRES=null;
+const sleep=ms=>new Promise(r=>setTimeout(r,ms));
+const NULL_BODY=new Set([101,204,205,304]);
+const RETRY_STATUS=new Set([429,500,502,503,504,529]);
+function abortErr(){const e=new Error('Đã hủy.');e.name='AbortError';return e}
+function nativeMode(){return CFG.net.mode!=='browser'&&!!(DESK||TAURI_FETCH)}
+function hostOf(u){try{return new URL(u).host||String(u)}catch(e){return String(u)}}
+function netReason(msg){msg=String(msg||'');
+ const m=[[/ERR_NAME_NOT_RESOLVED|ENOTFOUND|EAI_AGAIN/,'không phân giải được tên miền (mất mạng hoặc DNS bị chặn)'],[/ERR_INTERNET_DISCONNECTED|ENETUNREACH/,'máy chưa kết nối mạng'],[/ERR_CONNECTION_TIMED_OUT|ETIMEDOUT|ERR_TIMED_OUT/,'kết nối quá thời gian chờ (mạng chậm hoặc bị chặn)'],[/ERR_CONNECTION_REFUSED|ECONNREFUSED/,'máy chủ từ chối kết nối'],[/ERR_CONNECTION_RESET|ECONNRESET|ERR_CONNECTION_CLOSED|ERR_EMPTY_RESPONSE/,'kết nối bị ngắt giữa chừng (tường lửa/proxy có thể đã cắt)'],[/ERR_PROXY|ERR_TUNNEL/,'lỗi proxy — kiểm tra địa chỉ proxy ở Cài đặt AI → Mạng'],[/ERR_CERT|CERT_|ERR_SSL|SSL/,'chứng chỉ bảo mật không hợp lệ (phần mềm diệt virus/proxy trường chặn HTTPS, hoặc ngày giờ máy bị sai)']];
+ for(const[re,t]of m)if(re.test(msg))return t;return''}
+function netError(e,url,timedOut){
+ const h=hostOf(url),r=netReason(e&&e.message);let why;
+ if(timedOut)why='máy chủ '+h+' không phản hồi kịp (quá thời gian chờ). Mạng có thể đang chậm hoặc bị chặn.';
+ else if(navigator.onLine===false)why='máy đang ngoại tuyến — hãy kiểm tra Wi-Fi/dây mạng.';
+ else if(r)why=r+' ('+h+').';
+ else if(nativeMode())why='không tới được '+h+'. Kiểm tra mạng/tường lửa; nếu mạng trường dùng proxy, nhập địa chỉ proxy ở Cài đặt AI → Mạng.';
+ else if(HOST_KIND==='file')why='không tới được '+h+'. Bản chạy từ tệp này không có cầu nối mạng gốc nên có thể bị chặn (CORS/tường lửa). Hãy dùng bản .exe đóng gói theo hướng dẫn, hoặc mở bằng GitHub Pages, hoặc nhập địa chỉ proxy.';
+ else why='không tới được '+h+'. Thường do mất mạng, tường lửa/proxy chặn, hoặc địa chỉ proxy sai. Thử “Kiểm tra mạng” trong Cài đặt AI.';
+ const raw=e&&e.message?String(e.message):'';
+ const err=new Error('Không kết nối được: '+why+(raw&&!timedOut&&raw!=='Failed to fetch'?' [Chi tiết: '+raw.slice(0,160)+']':''));err.net=true;err.cause0=e;NET.last={ok:false,at:Date.now(),err:String(e&&e.message||e)};return err}
+/* fetch qua cầu nối Electron: trả về Response chuẩn (có stream) */
+function deskFetch(url,opts){
+ return new Promise((resolve,reject)=>{
+  const id=uid()+Date.now().toString(36),sig=opts.signal;let ctrl=null,got=false,done=false;
+  const stream=new ReadableStream({start(c){ctrl=c},cancel(){if(!done){done=true;DESK.abort(id)}}});
+  const fail=err=>{if(done)return;done=true;if(!got)reject(err);else{try{ctrl.error(err)}catch(e){}}};
+  const onAbort=()=>{if(!done)DESK.abort(id);fail(abortErr())};
+  if(sig){if(sig.aborted)return reject(abortErr());sig.addEventListener('abort',onAbort,{once:true})}
+  let body=opts.body;if(body!=null&&typeof body!=='string')body=String(body);
+  DESK.request({id,url:String(url),method:String(opts.method||'GET').toUpperCase(),headers:opts.headers||{},body:body==null?null:body},{
+   onHead:h=>{got=true;resolve(new Response(NULL_BODY.has(h.status)?null:stream,{status:h.status,statusText:h.statusText||'',headers:h.headers||{}}))},
+   onData:u8=>{if(!done){try{ctrl.enqueue(u8)}catch(e){}}},
+   onEnd:()=>{if(!done){done=true;try{ctrl.close()}catch(e){}}if(sig)sig.removeEventListener('abort',onAbort)},
+   onError:(msg,aborted)=>{if(aborted)fail(abortErr());else fail(new TypeError(msg||'Network error'))}});
+ })}
+/* fetch “thông minh”: chọn đường mạng, hết giờ chờ, tự thử lại khi lỗi mạng / máy chủ bận */
+async function netFetch(url,opts={}){
+ const o=Object.assign({},opts),headTimeout=o.headTimeout||120000,maxRetry=o.retries==null?2:o.retries,user=o.signal;delete o.headTimeout;delete o.retries;
+ for(let attempt=0;;attempt++){
+  if(user&&user.aborted)throw abortErr();
+  const c=new AbortController();let timedOut=false;
+  if(user)user.addEventListener('abort',()=>c.abort(),{once:true});
+  const timer=setTimeout(()=>{timedOut=true;c.abort()},headTimeout);
+  try{
+   const call=Object.assign({},o,{signal:c.signal});
+   const via=nativeMode()?(DESK?'electron':'tauri'):'browser';
+   const res=await(via==='electron'?deskFetch(url,call):via==='tauri'?TAURI_FETCH(url,call):fetch(url,call));
+   clearTimeout(timer);NET.last={ok:true,at:Date.now(),via,status:res.status};
+   if(RETRY_STATUS.has(res.status)&&attempt<maxRetry){
+    const ra=Math.min(15,Math.max(0,num(res.headers.get('retry-after'),0)));try{if(res.body)await res.body.cancel()}catch(e){}
+    await sleep(ra?ra*1000:1200*(attempt+1));continue}
+   return res
+  }catch(e){
+   clearTimeout(timer);
+   if(user&&user.aborted)throw abortErr();
+   if(!timedOut&&attempt<maxRetry){await sleep(900*(attempt+1));continue}
+   throw netError(e,url,timedOut)}}}
+async function applyProxy(silent){
+ if(!DESK||!DESK.setProxy)return;
+ try{const r=await DESK.setProxy((CFG.net.proxy||'').trim());NET.proxy=(r&&r.proxy)||'';
+  if(!silent)toast(NET.proxy?'Đã áp dụng proxy: '+NET.proxy:'Đang dùng cấu hình proxy của Windows.','ok')}
+ catch(e){if(!silent)toast('Không áp dụng được proxy: '+(e&&e.message||e),'warn',7000)}}
+async function initNet(){
+ window.addEventListener('online',()=>{NET.online=true;try{renderTop()}catch(e){}toast('Đã có mạng trở lại.','ok')});
+ window.addEventListener('offline',()=>{NET.online=false;try{renderTop()}catch(e){}toast('Mất kết nối mạng — vẫn soạn, sửa, xuất dữ liệu đã có; chức năng AI sẽ hoạt động lại khi có mạng.','warn',7000)});
+ if(DESK){try{NET.info=await Promise.race([DESK.info(),sleep(1500).then(()=>null)])}catch(e){}
+  if(NET.info&&NET.info.hasLibs){const l=document.getElementById('katexCss');if(l)l.href='libs/katex/katex.min.css'}
+  await applyProxy(true)}}
+async function netTest(){
+ const p=CFG.provider,P=PROV[p],key=(KEYS[p]||'').trim(),base=(CFG.base[p]||P.base).replace(/\/+$/,'');
+ const rows=[],add=(name,ok,detail,warn)=>rows.push({name,ok,detail,warn:!!warn});
+ ABORT=new AbortController();const signal=ABORT.signal;showBusy('Đang kiểm tra kết nối mạng…');
+ const reach=async(name,u,method)=>{const t0=performance.now();
+  try{await netFetch(u,{method:method||'HEAD',mode:'no-cors',cache:'no-store',signal,headTimeout:12000,retries:0});add(name,true,'Tới được ('+Math.round(performance.now()-t0)+' ms)')}
+  catch(e){if(e.name==='AbortError')throw e;add(name,false,e.message.replace(/^Không kết nối được: /,''))}};
+ try{
+  add('Đường truyền',true,HOST_NAME[HOST_KIND]+(nativeMode()?' — dùng mạng gốc của ứng dụng, không bị trình duyệt chặn (CORS).':' — dùng fetch của trình duyệt.')+(NET.proxy?' Proxy: '+NET.proxy+'.':''),false);
+  const t0=performance.now(),nm='Máy chủ '+P.name;
+  try{let res;
+   if(key){
+    if(p==='claude')res=await netFetch(base+'/v1/models?limit=1',{signal,headers:{'x-api-key':key,'anthropic-version':'2023-06-01','anthropic-dangerous-direct-browser-access':'true'},headTimeout:20000,retries:0});
+    else if(p==='openai')res=await netFetch(base+'/v1/models',{signal,headers:{authorization:'Bearer '+key},headTimeout:20000,retries:0});
+    else res=await netFetch(base+'/v1beta/models?pageSize=1&key='+encodeURIComponent(key),{signal,headTimeout:20000,retries:0});
+    const ms=Math.round(performance.now()-t0);
+    if(res.ok)add(nm,true,'Kết nối được ('+ms+' ms) · API key hợp lệ');
+    else if(res.status===401||res.status===403)add(nm,false,'Tới được máy chủ nhưng API key bị từ chối (HTTP '+res.status+'). Hãy kiểm tra lại key.');
+    else if(res.status===404)add(nm,true,'Tới được máy chủ ('+ms+' ms) nhưng đường dẫn kiểm tra không tồn tại (thường gặp khi dùng proxy). Bấm “Kiểm tra kết nối” ở trên để thử gọi AI thật.',true);
+    else add(nm,false,'Máy chủ trả về HTTP '+res.status+(HTTP_HINT[res.status]?' — '+HTTP_HINT[res.status]:''))}
+   else{await netFetch(base,{signal,method:'HEAD',mode:'no-cors',cache:'no-store',headTimeout:12000,retries:0});add(nm,true,'Tới được máy chủ ('+Math.round(performance.now()-t0)+' ms) — nhưng chưa nhập API key.',true)}}
+  catch(e){if(e.name==='AbortError')throw e;add(nm,false,e.message.replace(/^Không kết nối được: /,''))}
+  await reach('Kho thư viện jsDelivr (công thức, đọc PDF)','https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/katex.min.css');
+  await reach('Kho thư viện cdnjs (đọc Word, Excel, MP3)','https://cdnjs.cloudflare.com/ajax/libs/mammoth/1.6.0/mammoth.browser.min.js');
+  if(DESK){const has=!!(NET.info&&NET.info.hasLibs);add('Thư viện đóng gói sẵn (libs/)',has,has?'Có — công thức, đọc Word/PDF/Excel dùng được cả khi không có mạng.':'Chưa có — bản này cần mạng để tải thư viện công thức, đọc Word/PDF/Excel.',!has)}
+ }catch(e){hideBusy();if(e.name==='AbortError'){toast('Đã hủy kiểm tra.','warn');return}throw e}
+ hideBusy();NETRES=rows;if(S.tab==='settings')renderView();
+ const bad=rows.filter(r=>!r.ok).length;toast(bad?'Có '+bad+' mục chưa đạt — xem bảng kết quả ở Cài đặt AI.':'Mạng hoạt động tốt.',bad?'warn':'ok',6000)}
 async function callAI({system='',user='',atts=[],maxTokens,label,json=false}){
  const p=CFG.provider,key=(KEYS[p]||'').trim();
  if(!key)throw new Error('Chưa nhập API key '+PROV[p].name+' — vào mục “Cài đặt AI”.');
@@ -262,7 +372,7 @@ async function callAI({system='',user='',atts=[],maxTokens,label,json=false}){
    content.push({type:'text',text:user});
    const body={model,max_tokens:mt,system,messages:[{role:'user',content}],stream:true};
    if(CFG.temp!==''&&CFG.temp!=null)body.temperature=num(CFG.temp);
-   const res=await fetch(base+'/v1/messages',{method:'POST',signal,headers:{'content-type':'application/json','x-api-key':key,'anthropic-version':'2023-06-01','anthropic-dangerous-direct-browser-access':'true'},body:JSON.stringify(body)});
+   const res=await netFetch(base+'/v1/messages',{method:'POST',signal,headTimeout:90000,headers:{'content-type':'application/json','x-api-key':key,'anthropic-version':'2023-06-01','anthropic-dangerous-direct-browser-access':'true'},body:JSON.stringify(body)});
    if(!res.ok)throw new Error(await errText(res));
    const rd=res.body.getReader(),dec=new TextDecoder();let buf='',out='',trunc=false;
    for(;;){const{done,value}=await rd.read();if(done)break;buf+=dec.decode(value,{stream:true});let i;
@@ -277,20 +387,21 @@ async function callAI({system='',user='',atts=[],maxTokens,label,json=false}){
    const parts=[{type:'text',text:user}];atts.forEach(a=>parts.push(a.kind==='image'?{type:'image_url',image_url:{url:'data:'+a.mime+';base64,'+a.b64}}:{type:'file',file:{filename:a.name,file_data:'data:application/pdf;base64,'+a.b64}}));
    const body={model,max_completion_tokens:mt,messages:[{role:'system',content:system},{role:'user',content:parts}]};
    if(json)body.response_format={type:'json_object'};if(CFG.temp!==''&&CFG.temp!=null)body.temperature=num(CFG.temp);
-   const res=await fetch(base+'/v1/chat/completions',{method:'POST',signal,headers:{'content-type':'application/json','authorization':'Bearer '+key},body:JSON.stringify(body)});
+   const res=await netFetch(base+'/v1/chat/completions',{method:'POST',signal,headTimeout:600000,headers:{'content-type':'application/json','authorization':'Bearer '+key},body:JSON.stringify(body)});
    if(!res.ok)throw new Error(await errText(res));const j=await res.json();const ch=j.choices&&j.choices[0];
    if(ch&&ch.finish_reason==='length')throw new Error('Phản hồi bị cắt vì hết giới hạn token. Hãy tăng “Số token tối đa” hoặc sinh từng phần nhỏ hơn.');
    const t=ch&&ch.message&&ch.message.content;if(!t)throw new Error('AI trả về nội dung rỗng.');return t}
   /* gemini */
   const parts=atts.map(a=>({inline_data:{mime_type:a.mime,data:a.b64}}));parts.push({text:user});
   const gc={maxOutputTokens:mt};if(json)gc.responseMimeType='application/json';if(CFG.temp!==''&&CFG.temp!=null)gc.temperature=num(CFG.temp);
-  const res=await fetch(base+'/v1beta/models/'+encodeURIComponent(model)+':generateContent?key='+encodeURIComponent(key),{method:'POST',signal,headers:{'content-type':'application/json'},body:JSON.stringify({systemInstruction:{parts:[{text:system}]},contents:[{role:'user',parts}],generationConfig:gc})});
+  const res=await netFetch(base+'/v1beta/models/'+encodeURIComponent(model)+':generateContent?key='+encodeURIComponent(key),{method:'POST',signal,headTimeout:600000,headers:{'content-type':'application/json'},body:JSON.stringify({systemInstruction:{parts:[{text:system}]},contents:[{role:'user',parts}],generationConfig:gc})});
   if(!res.ok)throw new Error(await errText(res));const j=await res.json();const c=j.candidates&&j.candidates[0];
   if(c&&c.finishReason==='MAX_TOKENS')throw new Error('Phản hồi bị cắt vì hết giới hạn token. Hãy tăng “Số token tối đa” hoặc sinh từng phần nhỏ hơn.');
   const t=c&&c.content&&c.content.parts&&c.content.parts.map(x=>x.text||'').join('');if(!t)throw new Error('AI trả về nội dung rỗng'+(j.promptFeedback?' (bị chặn: '+JSON.stringify(j.promptFeedback)+')':'.'));return t
  }catch(e){
   if(e.name==='AbortError')throw new Error('Đã hủy.');
-  if(e instanceof TypeError)throw new Error('Không kết nối được tới '+PROV[p].name+'. Kiểm tra mạng, API key hoặc dùng địa chỉ proxy trong “Cài đặt AI”. ('+e.message+')');
+  if(e.net)throw e;
+  if(e instanceof TypeError)throw netError(e,base);
   throw e}
 }
 /* --- đọc JSON từ phản hồi, sửa lỗi dấu \ của LaTeX --- */
@@ -318,10 +429,23 @@ async function aiJSON(opts){const raw=await callAI(Object.assign({json:true},opt
   return extractJSON(fixed)}}
 
 /* ---------- 6. Nạp tệp nguồn ---------- */
-const LIBS={katex:['https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/katex.min.js','https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/contrib/auto-render.min.js'],mammoth:['https://cdnjs.cloudflare.com/ajax/libs/mammoth/1.6.0/mammoth.browser.min.js'],pdfjs:['https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js'],xlsx:['https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js'],lame:['https://cdnjs.cloudflare.com/ajax/libs/lamejs/1.2.1/lame.min.js']};
-const LOADED={};
-function loadScript(src){return new Promise((res,rej)=>{const s=document.createElement('script');s.src=src;s.onload=res;s.onerror=()=>rej(new Error('Không tải được thư viện: '+src));document.head.appendChild(s)})}
-async function loadLib(n){if(!LOADED[n])LOADED[n]=(async()=>{for(const s of LIBS[n])await loadScript(s)})();try{await LOADED[n]}catch(e){LOADED[n]=null;throw e}}
+/* Mỗi thư viện có tối đa 3 nguồn: cdn (chính), cdn2 (dự phòng), local (thư mục libs/ đóng gói trong bản .exe).
+   Bản .exe có libs/ thì dùng local trước → chạy được cả khi mất mạng; trên web thì local là phương án cuối. */
+const LIBS={
+ katex:{cdn:['https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/katex.min.js','https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/contrib/auto-render.min.js'],cdn2:['https://cdnjs.cloudflare.com/ajax/libs/KaTeX/0.16.11/katex.min.js','https://cdnjs.cloudflare.com/ajax/libs/KaTeX/0.16.11/contrib/auto-render.min.js'],local:['libs/katex/katex.min.js','libs/katex/contrib/auto-render.min.js']},
+ mammoth:{cdn:['https://cdnjs.cloudflare.com/ajax/libs/mammoth/1.6.0/mammoth.browser.min.js'],cdn2:['https://cdn.jsdelivr.net/npm/mammoth@1.6.0/mammoth.browser.min.js'],local:['libs/mammoth.browser.min.js']},
+ pdfjs:{cdn:['https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js'],cdn2:['https://cdn.jsdelivr.net/npm/pdfjs-dist@3.11.174/build/pdf.min.js'],local:['libs/pdf.min.js']},
+ xlsx:{cdn:['https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js'],cdn2:['https://cdn.jsdelivr.net/npm/xlsx@0.18.5/dist/xlsx.full.min.js'],local:['libs/xlsx.full.min.js']},
+ lame:{cdn:['https://cdnjs.cloudflare.com/ajax/libs/lamejs/1.2.0/lame.min.js'],cdn2:['https://cdn.jsdelivr.net/npm/lamejs@1.2.0/lame.min.js'],local:['libs/lame.min.js']}};
+const PDF_WORKER={cdn:'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js',cdn2:'https://cdn.jsdelivr.net/npm/pdfjs-dist@3.11.174/build/pdf.worker.min.js',local:'libs/pdf.worker.min.js'};
+const LOADED={},LIBSRC={};
+function loadScript(src){return new Promise((res,rej)=>{const s=document.createElement('script');s.src=src;s.onload=res;s.onerror=()=>{s.remove();rej(new Error('Không tải được thư viện: '+src))};document.head.appendChild(s)})}
+function libOrder(n){const o=['cdn','cdn2','local'].filter(k=>LIBS[n][k]);return(DESK&&NET.info&&NET.info.hasLibs)?['local'].concat(o.filter(k=>k!=='local')):o}
+async function loadLib(n){
+ if(!LOADED[n])LOADED[n]=(async()=>{let last=null;
+  for(const k of libOrder(n)){try{for(const s of LIBS[n][k])await loadScript(s);LIBSRC[n]=k;return}catch(e){last=e}}
+  throw last||new Error('Không tải được thư viện '+n)})();
+ try{await LOADED[n]}catch(e){LOADED[n]=null;throw e}}
 async function imgToB64(file,max=1600){const bmp=await createImageBitmap(file);const k=Math.min(1,max/Math.max(bmp.width,bmp.height));const c=document.createElement('canvas');c.width=Math.round(bmp.width*k);c.height=Math.round(bmp.height*k);c.getContext('2d').drawImage(bmp,0,0,c.width,c.height);return c.toDataURL('image/jpeg',.85).split(',')[1]}
 async function ingest(files){const texts=[],atts=[];
  for(const f of files){const ext=(f.name.split('.').pop()||'').toLowerCase();
@@ -330,7 +454,7 @@ async function ingest(files){const texts=[],atts=[];
    else if(ext==='docx'){await loadLib('mammoth');const r=await mammoth.extractRawText({arrayBuffer:await f.arrayBuffer()});texts.push({name:f.name,text:r.value})}
    else if(ext==='xlsx'||ext==='xls'){await loadLib('xlsx');const wb=XLSX.read(await f.arrayBuffer(),{type:'array'});texts.push({name:f.name,text:wb.SheetNames.map(n=>'## '+n+'\n'+XLSX.utils.sheet_to_csv(wb.Sheets[n])).join('\n\n')})}
    else if(ext==='pdf'){const buf=await f.arrayBuffer();let t='';
-    try{await loadLib('pdfjs');pdfjsLib.GlobalWorkerOptions.workerSrc='https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js';
+    try{await loadLib('pdfjs');pdfjsLib.GlobalWorkerOptions.workerSrc=PDF_WORKER[LIBSRC.pdfjs]||PDF_WORKER.cdn;
      const pdf=await pdfjsLib.getDocument({data:new Uint8Array(buf.slice(0))}).promise;for(let i=1;i<=pdf.numPages;i++){const pg=await pdf.getPage(i);const c=await pg.getTextContent();t+=c.items.map(x=>x.str).join(' ')+'\n\n'}}catch(e){t=''}
     if(t.replace(/\s/g,'').length>200)texts.push({name:f.name,text:t});
     else{if(buf.byteLength>20*1024*1024)toast('PDF quá lớn (>20MB): '+f.name,'warn');else{atts.push({kind:'pdf',name:f.name,mime:'application/pdf',b64:bufToB64(buf)});toast('PDF dạng ảnh/quét — sẽ gửi trực tiếp cho AI đọc: '+f.name,'info')}}}
@@ -543,7 +667,13 @@ async function exportWord(kind){if(!S.exam.questions.length&&kind!=='matrix')ret
 async function printDoc(kind){if(!S.exam.questions.length&&kind!=='matrix')return toast('Chưa có đề thi để in.','warn');
  if(!window.renderMathInElement){try{await loadLib('katex')}catch(e){toast('Không tải được KaTeX — công thức sẽ in ở dạng LaTeX.','warn',6000)}}
  const pa=$('#printArea');pa.innerHTML=buildDoc(kind);renderMath(pa);const t=document.title;document.title=DOC_NAME[kind]+'_'+subjectName();
- document.body.classList.add('printing');setTimeout(()=>{window.print()},katexWait());
+ document.body.classList.add('printing');
+ if(DESK&&DESK.printPDF){await sleep(katexWait());   /* bản .exe: lưu thẳng ra tệp PDF, không phụ thuộc hộp thoại in */
+  try{const r=await DESK.printPDF({name:DOC_NAME[kind]+'_'+subjectName().replace(/[^\wÀ-ỹ]+/g,'-')+'_L'+S.info.grade+'.pdf',landscape:kind==='matrix'});
+   if(r&&r.ok)toast('Đã lưu PDF: '+r.path,'ok',7000);else if(!(r&&r.canceled))toast('Không tạo được PDF'+(r&&r.error?': '+r.error:'')+'. Thử lại hoặc dùng “Xuất Word”.','warn',7000)}
+  catch(e){toast('Không tạo được PDF: '+(e&&e.message||e),'warn',7000)}
+  document.body.classList.remove('printing');document.title=t;return}
+ setTimeout(()=>{window.print()},katexWait());
  const done=()=>{document.body.classList.remove('printing');document.title=t;window.removeEventListener('afterprint',done)};window.addEventListener('afterprint',done)}
 const katexWait=()=>window.renderMathInElement?250:1500;
 </script>
@@ -562,7 +692,8 @@ function navStatus(){const ms=matrixStatus(),has=S.exam.questions.length;
  return{settings:KEYS[CFG.provider]?'ok':'warn',info:S.info.subject?'ok':'',data:S.topics.length?'ok':'warn',matrix:S.topics.length?(ms.ok?'ok':'warn'):'',spec:S.topics.some(t=>S.spec[t.id]&&(S.spec[t.id].biet||S.spec[t.id].hieu||S.spec[t.id].vd))?'ok':'',exam:has?'ok':'',audio:S.audio.passages.length?'ok':'',export:''}}
 function renderNav(){const st=navStatus();$('#nav').innerHTML=TABS.map(([k,ic,t],i)=>'<button class="'+(S.tab===k?'on':'')+'" data-act="go" data-arg="'+k+'"><span class="ic">'+ic+'</span>'+(i+1)+'. '+t+(st[k]?'<span class="st '+st[k]+'">'+(st[k]==='ok'?'✓':'!')+'</span>':'')+'</button>').join('')}
 function renderTop(){const t=TABS.find(x=>x[0]===S.tab);$('#crumb').textContent=t[1]+' '+t[2];
- const has=!!KEYS[CFG.provider];$('#topActions').innerHTML='<span class="chip '+(has?'ok':'bad')+'">'+(has?'● '+PROV[CFG.provider].name+' · '+esc(CFG.model[CFG.provider]):'● Chưa có API key')+'</span><span class="chip">'+esc(subjectName())+' · Lớp '+esc(S.info.grade)+'</span><button class="btn sm" data-act="theme" title="Đổi giao diện sáng/tối">◐</button>'}
+ const has=!!KEYS[CFG.provider],exe=HOST_KIND==='electron'||HOST_KIND==='tauri';
+ $('#topActions').innerHTML='<span class="chip '+(NET.online?'ok':'bad')+'" title="'+esc(HOST_NAME[HOST_KIND])+'">'+(NET.online?'🌐 Trực tuyến':'⚠ Ngoại tuyến')+(exe?' · .exe':'')+'</span><span class="chip '+(has?'ok':'bad')+'">'+(has?'● '+PROV[CFG.provider].name+' · '+esc(CFG.model[CFG.provider]):'● Chưa có API key')+'</span><span class="chip">'+esc(subjectName())+' · Lớp '+esc(S.info.grade)+'</span><button class="btn sm" data-act="theme" title="Đổi giao diện sáng/tối">◐</button>'}
 function applyTheme(){const d=CFG.theme==='dark'||(CFG.theme==='auto'&&window.matchMedia&&window.matchMedia('(prefers-color-scheme: dark)').matches);document.documentElement.setAttribute('data-theme',d?'dark':'light')}
 function go(tab){S.tab=tab;saveProject();renderView();window.scrollTo(0,0)}
 const VIEWS={};
@@ -579,8 +710,21 @@ VIEWS.settings=()=>{const p=CFG.provider,P=PROV[p];
  '<div class="grid3" style="margin-top:12px">'+fld('Địa chỉ API tùy chỉnh (proxy) — để trống nếu dùng mặc định',inp('CFG.base.'+p,{ph:P.base}))+fld('Temperature (để trống = mặc định của mô hình)',inp('CFG.temp',{ph:'vd 0.7'}))+'<div style="padding-top:20px">'+chk('CFG.remember','Nhớ API key trên trình duyệt này','keys')+'</div></div>'+
  '<div class="row-actions" style="margin-top:14px"><button class="btn primary" data-act="testAI">⚡ Kiểm tra kết nối</button><a class="btn ghost" href="'+P.link+'" target="_blank" rel="noopener">Lấy API key ↗</a></div>'+
  '<div class="note warn"><b>Lưu ý an toàn:</b> không dán API key vào mã nguồn hay đẩy lên GitHub. Hãy nhập key tại đây (lưu cục bộ). Nếu dùng máy chung, bỏ chọn “Nhớ API key” rồi đóng trình duyệt sau khi dùng. Nên đặt hạn mức chi tiêu trên trang quản lý API.</div></div>'+
+ netCard()+
  '<div class="card"><h3>🧭 Quy trình 7 bước</h3><ol style="margin:0;padding-left:20px;line-height:1.8"><li><b>Cài đặt AI</b>: nhập API key, bấm kiểm tra kết nối.</li><li><b>Thông tin & cấu trúc</b>: chọn cấp, lớp, môn, kỳ kiểm tra, mẫu cấu trúc theo Bộ GD&ĐT.</li><li><b>Dữ liệu đầu vào</b>: nạp tài liệu (Word/PDF/Excel/ảnh/văn bản) và lập danh sách chủ đề, yêu cầu cần đạt.</li><li><b>Ma trận</b>: phân bổ tự động / nhờ AI / nạp ma trận có sẵn.</li><li><b>Bản đặc tả</b>: AI viết mô tả mức độ đánh giá.</li><li><b>Soạn đề</b>: AI sinh câu hỏi bám ma trận, giáo viên chỉnh sửa, AI rà soát.</li><li><b>Audio</b> (môn ngoại ngữ) và <b>Xuất bản</b>: Word, PDF, nhiều mã đề, đáp án.</li></ol></div>'+
- '<details class="card"><summary>🚀 Đưa ứng dụng lên GitHub Pages</summary><ol style="line-height:1.8"><li>Tạo repository mới trên GitHub (ví dụ <code>soan-de-ai</code>), chọn Public.</li><li>Tải tệp <code>index.html</code> này lên (Add file → Upload files) rồi Commit.</li><li>Vào <b>Settings → Pages</b>, mục Source chọn <b>Deploy from a branch</b>, nhánh <code>main</code>, thư mục <code>/ (root)</code>, bấm Save.</li><li>Sau 1–2 phút truy cập <code>https://&lt;tên-tài-khoản&gt;.github.io/soan-de-ai/</code>.</li></ol><p class="hint">Dữ liệu và API key nằm trong trình duyệt từng máy; muốn chuyển máy hãy dùng “Xuất dự án (.json)”.</p></details>'}
+ '<details class="card"><summary>🚀 Đưa ứng dụng lên GitHub Pages</summary><ol style="line-height:1.8"><li>Tạo repository mới trên GitHub (ví dụ <code>soan-de-ai</code>), chọn Public.</li><li>Tải tệp <code>index.html</code> này lên (Add file → Upload files) rồi Commit.</li><li>Vào <b>Settings → Pages</b>, mục Source chọn <b>Deploy from a branch</b>, nhánh <code>main</code>, thư mục <code>/ (root)</code>, bấm Save.</li><li>Sau 1–2 phút truy cập <code>https://&lt;tên-tài-khoản&gt;.github.io/soan-de-ai/</code>.</li></ol><p class="hint">Dữ liệu và API key nằm trong trình duyệt từng máy; muốn chuyển máy hãy dùng “Xuất dự án (.json)”.</p></details>'+
+ '<details class="card"><summary>🖥️ Đóng gói thành file .exe (Windows)</summary><ol style="line-height:1.8"><li>Giải nén gói <code>SoanDeAI-exe.zip</code>, đưa toàn bộ lên một repository GitHub (hoặc chạy <code>build-exe.bat</code> trên máy Windows đã cài Node.js).</li><li>Vào tab <b>Actions → Build Windows EXE → Run workflow</b>; vài phút sau tải tệp <code>.exe</code> ở mục <b>Artifacts</b>.</li><li>Cài đặt hoặc chạy bản Portable. Bản .exe có <b>cầu nối mạng gốc</b> nên gọi AI không bị trình duyệt chặn, dùng được proxy của Windows và lưu PDF trực tiếp.</li></ol><p class="hint">Chi tiết xem tệp <code>HUONG-DAN-DONG-GOI-EXE.md</code> trong gói.</p></details>'}
+
+/* --- Thẻ “Mạng & bản .exe” trong Cài đặt AI --- */
+function netResHTML(){if(!NETRES)return'';
+ return'<div style="margin-top:12px">'+NETRES.map(r=>'<div style="display:flex;gap:10px;align-items:flex-start;margin:6px 0"><span class="chip '+(r.ok?(r.warn?'':'ok'):'bad')+'" style="flex:none">'+(r.ok?(r.warn?'! Lưu ý':'✓ Đạt'):'✗ Lỗi')+'</span><div><b>'+esc(r.name)+'</b><div class="hint" style="margin:2px 0 0">'+esc(r.detail)+'</div></div></div>').join('')+'</div>'}
+function netCard(){const exe=HOST_KIND==='electron'||HOST_KIND==='tauri',i=NET.info;
+ return'<div class="card"><h3>🌐 Mạng &amp; bản máy tính (.exe)</h3>'+
+ '<p class="hint" style="margin-top:0">Đang chạy: <b>'+esc(HOST_NAME[HOST_KIND])+'</b>'+(i?' · phiên bản '+esc(i.version||'')+' · Electron '+esc(i.electron||'')+' · '+esc(i.platform||''):'')+' · '+(NET.online?'đang trực tuyến':'<b>đang ngoại tuyến</b>')+(NET.proxy?' · proxy: '+esc(NET.proxy):'')+'</p>'+
+ '<div class="grid3">'+fld('Chế độ kết nối',sel('CFG.net.mode',[['auto','Tự động (khuyên dùng)'],['browser','Chỉ dùng kết nối của trình duyệt']],{rr:'net'}))+
+ fld('Proxy mạng (chỉ bản .exe)',inp('CFG.net.proxy',{ph:'vd http://10.10.1.1:8080 — để trống = theo Windows',rr:'net',attrs:exe?'':'disabled'}))+
+ '<div style="padding-top:20px"><button class="btn primary" data-act="netTest">📡 Kiểm tra mạng</button></div></div>'+netResHTML()+
+ '<details style="margin-top:12px"><summary>Bản .exe không gọi được AI? Hãy thử…</summary><ul style="line-height:1.8"><li>Bấm <b>Kiểm tra mạng</b> để biết bước nào bị lỗi (đường truyền, máy chủ AI, kho thư viện).</li><li>Mạng trường/cơ quan dùng proxy: nhập địa chỉ proxy dạng <code>http://địa-chỉ:cổng</code> ở trên rồi bấm Kiểm tra mạng lại.</li><li>Lần đầu chạy, nếu Windows Firewall hỏi quyền mạng cho “Soan De AI” hãy chọn <b>Cho phép</b>; phần mềm diệt virus cũng cần cho phép.</li><li>Báo lỗi chứng chỉ: kiểm tra <b>ngày giờ của máy</b>; nếu mạng trường chặn HTTPS thì nhờ quản trị mạng mở các tên miền <code>api.anthropic.com</code>, <code>generativelanguage.googleapis.com</code>, <code>api.openai.com</code>.</li><li>Không có mạng: vẫn soạn, sửa, xuất Word/PDF dữ liệu đã có. Bản .exe có thư mục <code>libs</code> còn dùng được công thức và đọc Word/PDF/Excel khi ngoại tuyến; riêng AI luôn cần mạng.</li></ul></details></div>'}
 
 /* --- Thông tin & cấu trúc --- */
 function presetsFor(){return PRESETS.filter(p=>p.lv.split(',').includes(S.info.level))}
@@ -715,6 +859,7 @@ VIEWS.export=()=>{const n=S.exam.questions.length;
 const ACT={
  go:a=>go(a),
  cancel:()=>{if(ABORT)ABORT.abort()},
+ netTest:()=>netTest(),
  theme:()=>{CFG.theme=document.documentElement.getAttribute('data-theme')==='dark'?'light':'dark';saveCfg();applyTheme()},
  testAI:async()=>{showBusy('Đang kiểm tra kết nối…');try{const t=await callAI({system:'Bạn là trợ lý.',user:'Trả lời đúng một từ: OK',maxTokens:300});hideBusy();toast('Kết nối thành công — AI trả lời: '+t.trim().slice(0,40),'ok')}catch(e){hideBusy();throw e}},
  pick:a=>{const f=$('#fileIn');f.dataset.target=a;f.accept=a==='proj'?'.json':'';f.multiple=a!=='proj';f.click()},
@@ -759,6 +904,7 @@ const HOOKS={
  st2:()=>{S.info.preset='';refreshStruct()},
  st:()=>{renderNav();renderTop()},
  cfg:()=>{saveCfg();renderView()},
+ net:()=>{saveCfg();applyProxy();renderView()},
  keys:()=>{saveKeys();renderTop()},
  pv:()=>{}
 };
@@ -813,10 +959,10 @@ const silence=s=>new Float32Array(Math.round(s*RATE));
 function concatF(list){const n=sum(list.map(x=>x.length)),o=new Float32Array(n);let k=0;list.forEach(x=>{o.set(x,k);k+=x.length});return o}
 async function ttsOpenAI(text,voice){const A=S.audio,key=KEYS.openai;if(!key)throw new Error('Chưa nhập API key OpenAI (Cài đặt AI).');const model=A.model.openai;
  const body={model,voice,input:text,response_format:'mp3'};if(/gpt-4o/.test(model))body.instructions='Speak clearly and naturally at a moderate pace, like a recording for a language listening test.';else if(num(A.rate,1)!==1)body.speed=clamp(num(A.rate,1),.5,2);
- const res=await fetch((CFG.base.openai||PROV.openai.base).replace(/\/+$/,'')+'/v1/audio/speech',{method:'POST',signal:ABORT.signal,headers:{'authorization':'Bearer '+key,'content-type':'application/json'},body:JSON.stringify(body)});
+ const res=await netFetch((CFG.base.openai||PROV.openai.base).replace(/\/+$/,'')+'/v1/audio/speech',{method:'POST',signal:ABORT.signal,headers:{'authorization':'Bearer '+key,'content-type':'application/json'},body:JSON.stringify(body)});
  if(!res.ok)throw new Error(await errText(res));const ab=await getAC().decodeAudioData(await res.arrayBuffer());return resample(monoOf(ab),ab.sampleRate,RATE)}
 async function ttsGemini(text,voice){const A=S.audio,key=KEYS.gemini;if(!key)throw new Error('Chưa nhập API key Gemini (Cài đặt AI).');
- const res=await fetch((CFG.base.gemini||PROV.gemini.base).replace(/\/+$/,'')+'/v1beta/models/'+encodeURIComponent(A.model.gemini)+':generateContent?key='+encodeURIComponent(key),{method:'POST',signal:ABORT.signal,headers:{'content-type':'application/json'},body:JSON.stringify({contents:[{parts:[{text}]}],generationConfig:{responseModalities:['AUDIO'],speechConfig:{voiceConfig:{prebuiltVoiceConfig:{voiceName:voice}}}}})});
+ const res=await netFetch((CFG.base.gemini||PROV.gemini.base).replace(/\/+$/,'')+'/v1beta/models/'+encodeURIComponent(A.model.gemini)+':generateContent?key='+encodeURIComponent(key),{method:'POST',signal:ABORT.signal,headers:{'content-type':'application/json'},body:JSON.stringify({contents:[{parts:[{text}]}],generationConfig:{responseModalities:['AUDIO'],speechConfig:{voiceConfig:{prebuiltVoiceConfig:{voiceName:voice}}}}})});
  if(!res.ok)throw new Error(await errText(res));const j=await res.json(),part=j.candidates&&j.candidates[0]&&j.candidates[0].content&&j.candidates[0].content.parts&&j.candidates[0].content.parts.find(p=>p.inlineData);
  if(!part)throw new Error('Gemini không trả về âm thanh.');const bin=atob(part.inlineData.data),n=bin.length>>1,f=new Float32Array(n);for(let i=0;i<n;i++){let v=bin.charCodeAt(2*i)|(bin.charCodeAt(2*i+1)<<8);if(v>=32768)v-=65536;f[i]=v/32768}
  const m=/rate=(\d+)/.exec(part.inlineData.mimeType||'');return resample(f,m?+m[1]:24000,RATE)}
@@ -843,7 +989,7 @@ async function buildAudio(){const A=S.audio;if(A.tts==='browser')return toast('H
 function addAudioOut(title,enc,base){const url=URL.createObjectURL(enc.blob),box=$('#audioOut');if(!box)return;const d=document.createElement('div');d.innerHTML='<b>'+esc(title)+'</b> <small class="hint">('+(enc.blob.size/1048576).toFixed(1)+' MB)</small><audio controls src="'+url+'"></audio><a class="btn sm" download="'+base+'_'+subjectName().replace(/[^\wÀ-ỹ]+/g,'-')+'.'+enc.ext+'" href="'+url+'">⬇ Tải '+enc.ext.toUpperCase()+'</a>';box.appendChild(d)}
 
 /* ---------- 14. Khởi động ---------- */
-function init(){applyTheme();$('#sideFoot').innerHTML=esc(COPY);$('#foot').innerHTML=esc(COPY)+' · Ứng dụng soạn đề kiểm tra định kì bằng AI';
+async function init(){applyTheme();try{await initNet()}catch(e){}$('#sideFoot').innerHTML=esc(COPY);$('#foot').innerHTML=esc(COPY)+' · Ứng dụng soạn đề kiểm tra định kì bằng AI';
  if(!S.info.preset&&!presetsFor().length)ensurePresetFits();
  if(location.hash&&VIEWS[location.hash.slice(1)])S.tab=location.hash.slice(1);
  else if(S.tab==='settings'&&KEYS[CFG.provider]&&!LS.get('dgm_project',null))S.tab='info';
